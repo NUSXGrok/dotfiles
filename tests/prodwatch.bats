@@ -36,7 +36,20 @@ echo '{"daily":[{"agent":"all","totalCost":0,"totalTokens":0,"agents":[]}]}'
 EOF
   printf '#!/bin/bash\nexit 0\n' > "$stub_dir/gh"
   printf '#!/bin/bash\ncat >/dev/null\n' > "$stub_dir/python3"
-  chmod +x "$stub_dir/ccusage" "$stub_dir/gh" "$stub_dir/python3"
+  printf '#!/bin/bash\nexit 0\n' > "$stub_dir/ioreg"
+  chmod +x "$stub_dir/ccusage" "$stub_dir/gh" "$stub_dir/python3" "$stub_dir/ioreg"
+}
+
+stub_battery() {
+  local stub_dir="$1" design="$2" nominal="$3" cycles="$4" failure="$5"
+  cat > "$stub_dir/ioreg" <<STUB
+#!/bin/bash
+echo '      "CycleCount" = $cycles'
+echo '      "DesignCapacity" = $design'
+echo '      "NominalChargeCapacity" = $nominal'
+echo '      "PermanentFailureStatus" = $failure'
+STUB
+  chmod +x "$stub_dir/ioreg"
 }
 
 # Helper to run the node parser snippet directly on a JSON string
@@ -365,6 +378,52 @@ EOF
   [[ "$output" =~ "<> 0 · 🐛 ↑0/↓0 | font=Menlo size=13" ]]
   [[ ! "$output" =~ "Disk ·" ]]
   [[ ! "$output" =~ "💾" ]]
+}
+
+@test "prodwatch shows battery health and cycle count" {
+  local stub_dir="$TEST_DIR/bin"
+  mkdir -p "$stub_dir" "$TEST_DIR/home/work" "$TEST_DIR/home/projects"
+  stub_quiet_sources "$stub_dir"
+  stub_battery "$stub_dir" 4629 4456 63 0
+
+  run env HOME="$TEST_DIR/home" PATH="$stub_dir:$PATH" bash "$PRODWATCH"
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "Battery · 96% health · 63 cycles | font=Menlo" ]]
+  [[ ! "$output" =~ "⚠️ battery" ]]
+  [[ ! "$output" =~ "63 cycles | font=Menlo color=red" ]]
+}
+
+@test "prodwatch flags battery health below 80% in red and in the title" {
+  local stub_dir="$TEST_DIR/bin"
+  mkdir -p "$stub_dir" "$TEST_DIR/home/work" "$TEST_DIR/home/projects"
+  stub_quiet_sources "$stub_dir"
+  stub_battery "$stub_dir" 5000 3900 812 0
+
+  run env HOME="$TEST_DIR/home" PATH="$stub_dir:$PATH" bash "$PRODWATCH"
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "⚠️ battery | font=Menlo size=13" ]]
+  [[ "$output" =~ "Battery · 78% health · 812 cycles | font=Menlo color=red" ]]
+}
+
+@test "prodwatch flags a battery permanent failure" {
+  local stub_dir="$TEST_DIR/bin"
+  mkdir -p "$stub_dir" "$TEST_DIR/home/work" "$TEST_DIR/home/projects"
+  stub_quiet_sources "$stub_dir"
+  stub_battery "$stub_dir" 4629 4456 63 1
+
+  run env HOME="$TEST_DIR/home" PATH="$stub_dir:$PATH" bash "$PRODWATCH"
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "Battery · 96% health · 63 cycles | font=Menlo color=red" ]]
+}
+
+@test "prodwatch omits the battery line when ioreg reports no battery" {
+  local stub_dir="$TEST_DIR/bin"
+  mkdir -p "$stub_dir" "$TEST_DIR/home/work" "$TEST_DIR/home/projects"
+  stub_quiet_sources "$stub_dir"
+
+  run env HOME="$TEST_DIR/home" PATH="$stub_dir:$PATH" bash "$PRODWATCH"
+  [ "$status" -eq 0 ]
+  [[ ! "$output" =~ "Battery ·" ]]
 }
 
 stub_counting_ccusage() {

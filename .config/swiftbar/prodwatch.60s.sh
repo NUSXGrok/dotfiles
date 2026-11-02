@@ -236,6 +236,18 @@ case "$smart_status" in
   *) disk_alert=1 ;;
 esac
 [ "${disk_used_percent:-0}" -gt 90 ] 2>/dev/null && disk_alert=1
+battery_info="$(ioreg -rn AppleSmartBattery 2>/dev/null | awk '
+  /^ +"CycleCount" = /{cycles=$3}
+  /^ +"DesignCapacity" = /{design=$3}
+  /^ +"NominalChargeCapacity" = /{nominal=$3}
+  /^ +"PermanentFailureStatus" = /{failure=$3}
+  END{if (design > 0 && nominal > 0) printf "%d %d %d", nominal * 100 / design, cycles, failure}')"
+read -r battery_health battery_cycles battery_failure <<<"$battery_info"
+battery_alert=""
+if [ -n "$battery_health" ]; then
+  [ "$battery_health" -lt 80 ] && battery_alert=1
+  [ "${battery_failure:-0}" -ne 0 ] && battery_alert=1
+fi
 disk_free_percent=""
 [[ "$disk_used_percent" =~ ^[0-9]+$ ]] && disk_free_percent=$((100 - disk_used_percent))
 system_parts=()
@@ -246,6 +258,7 @@ elif [ -n "$disk_free" ]; then
   system_parts+=("💾 ${disk_free} free")
 fi
 [ -n "$disk_alert" ] && system_parts+=("⚠️ disk")
+[ -n "$battery_alert" ] && system_parts+=("⚠️ battery")
 system_title=""
 for part in "${system_parts[@]}"; do
   system_title+="${system_title:+ · }${part}"
@@ -289,6 +302,11 @@ if [ -n "$smart_status" ] || [ -n "$disk_free" ]; then
   disk_style="font=Menlo"
   [ -n "$disk_alert" ] && disk_style+=" color=red"
   echo "${disk_line} | ${disk_style}"
+fi
+if [ -n "$battery_health" ]; then
+  battery_style="font=Menlo"
+  [ -n "$battery_alert" ] && battery_style+=" color=red"
+  echo "Battery · ${battery_health}% health · ${battery_cycles} cycles | ${battery_style}"
 fi
 echo "---"
 echo "Updated $(date +%H:%M) | size=11 color=gray"
