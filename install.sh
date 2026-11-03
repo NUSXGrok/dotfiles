@@ -521,6 +521,38 @@ PLIST
   fi
 }
 
+install_prodwatch_identity() {
+  local identity_file="$HOME/.config/prodwatch/identity"
+  if ! is_office_machine; then
+    rm -f "$identity_file"
+    return 0
+  fi
+  mkdir -p "$(dirname "$identity_file")"
+  printf '%s\n' \
+    "PRODWATCH_WORK_AUTHOR=$OFFICE_GITHUB_USER" \
+    "PRODWATCH_PROJ_AUTHOR=$OFFICE_GITHUB_USER" \
+    "PRODWATCH_GITHUB_USER=$OFFICE_GITHUB_USER" > "$identity_file"
+  echo "GEN   $identity_file (tracking $OFFICE_GITHUB_USER)"
+}
+
+grok_is_installed() {
+  [ -d "$HOME/.grok" ] || command -v grok >/dev/null 2>&1
+}
+
+install_grok_guard() {
+  if ! is_office_machine && ! grok_is_installed; then
+    echo "SKIP  grok identity guard (non-office machine without Grok)"
+    return 0
+  fi
+  local hooks_dst="$HOME/.grok/hooks"
+  mkdir -p "$hooks_dst"
+  install -m 0755 "$DOTFILES/grok/hooks/identity-guard.sh" "$hooks_dst/identity-guard.sh"
+  jq --arg users "$OFFICE_USERS" \
+    '.hooks.PreToolUse[0].hooks[0].command = "GROK_GUARD_OFFICE_USERS='"'"'\($users)'"'"' " + .hooks.PreToolUse[0].hooks[0].command' \
+    "$DOTFILES/grok/hooks/identity-guard.json" > "$hooks_dst/identity-guard.json"
+  echo "COPY  $hooks_dst/identity-guard.sh, identity-guard.json"
+}
+
 install_hooks() {
   local hooks_src="$DOTFILES/.claude/hooks"
   local hooks_dst="$HOME/.claude/hooks"
@@ -697,6 +729,11 @@ IS_DARWIN=0
 # Override via DOTFILES_WORK_HOSTNAME if your work hostname differs from the default.
 WORK_HOSTNAME="${DOTFILES_WORK_HOSTNAME:-Shuis-MacBook-Air}"
 is_work_machine() { [ "$(hostname -s)" = "$WORK_HOSTNAME" ]; }
+OFFICE_USERS="${DOTFILES_OFFICE_USERS:-aisystems adminit}"
+OFFICE_GITHUB_USER="NUSXGrok"
+is_office_machine() {
+  [ "$IS_DARWIN" = 1 ] && ! is_work_machine && [[ " $OFFICE_USERS " == *" $(id -un) "* ]]
+}
 
 real_user_home() {
   dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2}'
@@ -704,6 +741,11 @@ real_user_home() {
 
 if [ "${1:-}" = "--is-work-machine" ]; then
   is_work_machine
+  exit $?
+fi
+
+if [ "${1:-}" = "--is-office-machine" ]; then
+  is_office_machine
   exit $?
 fi
 
@@ -776,6 +818,8 @@ if [ "$IS_DARWIN" = 1 ]; then
 
   # Antigravity 2.0 (Desktop Electron app / IDE) settings: global permission grants
   install_antigravity_desktop_settings
+
+  install_grok_guard
 fi
 
 # Pre-warm Trivy's vulnerability DB for the work-laptop skill-scan guard
@@ -800,9 +844,10 @@ fi
 # Work machine only — the plugin scans ~/work repos and ccusage, which only make
 # sense here. macOS only (SwiftBar is a mac cask). Symlinks the plugin into
 # ~/.config/swiftbar and points SwiftBar's plugin dir at it.
-if [ "$IS_DARWIN" = 1 ] && is_work_machine; then
+if [ "$IS_DARWIN" = 1 ] && { is_work_machine || is_office_machine; }; then
   mkdir -p "$HOME/.config/swiftbar"
   symlink .config/swiftbar/prodwatch.60s.sh
+  install_prodwatch_identity
   # SwiftBar's bundle id is com.ameba.SwiftBar; store the plugin dir it watches.
   if [ "$HOME" = "$(real_user_home)" ]; then
     defaults write com.ameba.SwiftBar PluginDirectory "$HOME/.config/swiftbar"
@@ -811,18 +856,18 @@ if [ "$IS_DARWIN" = 1 ] && is_work_machine; then
     echo "SKIP  SwiftBar PluginDirectory (HOME is not the real user home)"
   fi
 else
-  echo "SKIP  SwiftBar widget (non-work machine or non-macOS)"
+  echo "SKIP  SwiftBar widget (personal machine or non-macOS)"
 fi
 
 # Personal laptops use sonnet (lower subscription limits); work machine keeps the manifest model.
-if ! is_work_machine; then
+if ! is_work_machine && ! is_office_machine; then
   jq '.model = "sonnet" | .effortLevel = "high"' "$HOME/.claude/settings.json" > "$HOME/.claude/settings.json.tmp" \
     && mv "$HOME/.claude/settings.json.tmp" "$HOME/.claude/settings.json"
   echo "SET   $HOME/.claude/settings.json model -> sonnet, effortLevel -> high (personal)"
 else
   manifest_model=$(jq -r '.model' "$HOME/.claude/settings.json")
   manifest_effort=$(jq -r '.effortLevel' "$HOME/.claude/settings.json")
-  echo "SKIP  sonnet switch (work machine — keeping $manifest_model, effortLevel $manifest_effort)"
+  echo "SKIP  sonnet switch (work/office machine — keeping $manifest_model, effortLevel $manifest_effort)"
 fi
 
 echo "Done."
