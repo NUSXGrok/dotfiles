@@ -27,6 +27,8 @@ setup() {
   export DOTFILES_SKIP_ZSH_PLUGINS=1
   export DOTFILES_SKIP_FINDER_DEFAULTS=1
   export DOTFILES_OFFICE_USERS="no-such-office-user"
+  id() { [ "$1" = "-un" ] && echo "tester" || command id "$@"; }
+  export -f id
 
   # Store original environment
   ORIGINAL_DEEPSEEK_TOKEN="${DEEPSEEK_AUTH_TOKEN:-}"
@@ -364,6 +366,36 @@ EOF
   run bash "$INSTALL_SCRIPT" --is-work-machine
   [ "$status" -eq 0 ]
   [ -z "$output" ]
+}
+
+@test "is_work_machine_flag_exits_0_for_mac_mini_account" {
+  uname() { echo "Darwin"; }
+  hostname() { echo "AIs-Mac-mini"; }
+  id() { [ "$1" = "-un" ] && echo "macmini12" || command id "$@"; }
+  export -f uname hostname id
+
+  run bash "$INSTALL_SCRIPT" --is-work-machine
+  [ "$status" -eq 0 ]
+}
+
+@test "is_work_machine_flag_rejects_non_numeric_mac_mini_suffix" {
+  uname() { echo "Darwin"; }
+  hostname() { echo "AIs-Mac-mini"; }
+  id() { [ "$1" = "-un" ] && echo "macmini2x" || command id "$@"; }
+  export -f uname hostname id
+
+  run bash "$INSTALL_SCRIPT" --is-work-machine
+  [ "$status" -eq 1 ]
+}
+
+@test "is_work_machine_flag_ignores_mac_mini_account_on_linux" {
+  uname() { echo "Linux"; }
+  hostname() { echo "sandbox"; }
+  id() { [ "$1" = "-un" ] && echo "macmini3" || command id "$@"; }
+  export -f uname hostname id
+
+  run bash "$INSTALL_SCRIPT" --is-work-machine
+  [ "$status" -eq 1 ]
 }
 
 @test "ghostty_config_linked_on_any_mac" {
