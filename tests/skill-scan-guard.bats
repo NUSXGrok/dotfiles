@@ -12,7 +12,8 @@ setup() {
 
   # Default: pretend we're on the work laptop unless a test overrides.
   hostname() { echo "Shuis-MacBook-Air"; }
-  export -f hostname
+  id() { [ "$1" = "-un" ] && echo "tester" || command id "$@"; }
+  export -f hostname id
 
   # Stub scanner: emits Trivy --format json with STUB_ISSUES findings (default
   # 0 = clean), reported as Vulnerabilities. Each finding's Title carries a
@@ -98,6 +99,17 @@ run_hook() {
   run_hook "claude plugin install $WORKDIR/sk"
   [ "$status" -eq 2 ]
   [[ "$output" == *"not found"* ]]
+}
+
+@test "mac mini account: install is scanned off the work hostname" {
+  hostname() { echo "AIs-Mac-mini"; }
+  id() { [ "$1" = "-un" ] && echo "macmini4" || command id "$@"; }
+  export -f hostname id
+  mkdir -p "$WORKDIR/sk"
+  export STUB_ISSUES=1
+  run_hook "claude plugin install $WORKDIR/sk"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"BLOCKED (skill-scan)"* ]]
 }
 
 @test "work host: custom DOTFILES_WORK_HOSTNAME is honored" {

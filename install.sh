@@ -728,7 +728,8 @@ IS_DARWIN=0
 # Brewfile package selection via `install.sh --is-work-machine`).
 # Override via DOTFILES_WORK_HOSTNAME if your work hostname differs from the default.
 WORK_HOSTNAME="${DOTFILES_WORK_HOSTNAME:-Shuis-MacBook-Air}"
-is_work_machine() { [ "$(hostname -s)" = "$WORK_HOSTNAME" ]; }
+is_mac_mini_account() { [ "$IS_DARWIN" = 1 ] && [[ "$(id -un)" =~ ^macmini[0-9]+$ ]]; }
+is_work_machine() { [ "$(hostname -s)" = "$WORK_HOSTNAME" ] || is_mac_mini_account; }
 OFFICE_USERS="${DOTFILES_OFFICE_USERS:-aisystems adminit}"
 OFFICE_GITHUB_USER="NUSXGrok"
 is_office_machine() {

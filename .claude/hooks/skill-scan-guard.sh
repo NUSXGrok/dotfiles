@@ -45,7 +45,7 @@ set -uo pipefail
 
 # --- Work-laptop gate -------------------------------------------------------
 WORK_HOSTNAME="${DOTFILES_WORK_HOSTNAME:-Shuis-MacBook-Air}"
-[[ "$(hostname -s 2>/dev/null)" == "$WORK_HOSTNAME" ]] || exit 0
+[[ "$(hostname -s 2>/dev/null)" == "$WORK_HOSTNAME" || "$(id -un 2>/dev/null)" =~ ^macmini[0-9]+$ ]] || exit 0
 
 # --- Parse the tool input ---------------------------------------------------
 INPUT=$(cat)
