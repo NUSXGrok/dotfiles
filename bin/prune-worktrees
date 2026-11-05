@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+
+SKIP_DIRS = {"node_modules", ".git", ".venv", "venv", "__pycache__", ".terraform", "dist", "build", ".next"}
+DEAD_STATUSES = {"MISSING", "MERGED", "SQUASHED", "GONE"}
+
+
+@dataclass
+class Worktree:
+    repo: str
+    path: str
+    head: str = ""
+    branch: str = ""
+    prunable: bool = False
+    locked: bool = False
+    status: str = ""
+    reason: str = ""
+    dirty: bool = False
+    actions: list = field(default_factory=list)
+
+
+def git(repo, *args, check=False):
+    result = subprocess.run(
+        ["git", "-C", repo, *args],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "LC_ALL": "C", "GIT_TERMINAL_PROMPT": "0"},
+    )
+    if check and result.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed in {repo}: {result.stderr.strip()}")
+    return result
+
+
+def find_repos(root):
+    repos = []
+    for directory, subdirs, _ in os.walk(root):
+        if os.path.isdir(os.path.join(directory, ".git")):
+            repos.append(directory)
+            subdirs.clear()
+            continue
+        subdirs[:] = sorted(d for d in subdirs if d not in SKIP_DIRS)
+    return sorted(repos)
+
+
+def default_branch_ref(repo, remote):
+    symbolic = git(repo, "symbolic-ref", "--quiet", f"refs/remotes/{remote}/HEAD")
+    if symbolic.returncode == 0:
+        return symbolic.stdout.strip()
+    for candidate in ("main", "master"):
+        ref = f"refs/remotes/{remote}/{candidate}"
+        if git(repo, "show-ref", "--verify", "--quiet", ref).returncode == 0:
+            return ref
+    return None
+
+
+def list_worktrees(repo):
+    output = git(repo, "worktree", "list", "--porcelain", check=True).stdout
+    worktrees = []
+    for block in output.strip().split("\n\n"):
+        lines = block.splitlines()
+        if not lines:
+            continue
+        worktree = Worktree(repo=repo, path=lines[0].removeprefix("worktree "))
+        for line in lines[1:]:
+            if line.startswith("HEAD "):
+                worktree.head = line.removeprefix("HEAD ")
+            elif line.startswith("branch "):
+                worktree.branch = line.removeprefix("branch refs/heads/")
+            elif line.startswith("prunable"):
+                worktree.prunable = True
+            elif line.startswith("locked"):
+                worktree.locked = True
+        worktrees.append(worktree)
+    return worktrees[1:]
+
+
+def is_ancestor(repo, commit, target):
+    return git(repo, "merge-base", "--is-ancestor", commit, target).returncode == 0
+
+
+def is_squash_merged(repo, commit, target):
+    merge_base = git(repo, "merge-base", target, commit).stdout.strip()
+    if not merge_base:
+        return False
+    tree = git(repo, "rev-parse", f"{commit}^{{tree}}").stdout.strip()
+    synthetic = git(repo, "commit-tree", tree, "-p", merge_base, "-m", "squash-probe").stdout.strip()
+    if not synthetic:
+        return False
+    cherry = git(repo, "cherry", target, synthetic).stdout.strip()
+    return cherry.startswith("-")
+
+
+def upstream_state(repo, branch):
+    output = git(
+        repo, "for-each-ref", "--format=%(upstream)|%(upstream:track)", f"refs/heads/{branch}"
+    ).stdout.strip()
+    upstream, _, track = output.partition("|")
+    return upstream, track == "[gone]"
+
+
+def is_dirty(path):
+    return bool(git(path, "status", "--porcelain", "--untracked-files=normal").stdout.strip())
+
+
+def classify(worktree, target_ref):
+    repo = worktree.repo
+    if worktree.prunable or not os.path.isdir(worktree.path):
+        worktree.status, worktree.reason = "MISSING", "worktree directory no longer exists"
+        return
+    worktree.dirty = is_dirty(worktree.path)
+    if worktree.locked:
+        worktree.status, worktree.reason = "LOCKED", "worktree is locked"
+        return
+    if target_ref is None:
+        worktree.status, worktree.reason = "UNKNOWN", "no remote default branch found"
+        return
+    target_name = target_ref.removeprefix("refs/remotes/")
+    commit = worktree.branch or worktree.head
+    upstream, upstream_gone = upstream_state(repo, worktree.branch) if worktree.branch else ("", False)
+
+    if is_ancestor(repo, commit, target_ref):
+        if worktree.branch and not upstream:
+            worktree.status, worktree.reason = "NO_COMMITS", f"no commits beyond {target_name}, never pushed"
+        else:
+            worktree.status, worktree.reason = "MERGED", f"tip is contained in {target_name}"
+    elif is_squash_merged(repo, commit, target_ref):
+        worktree.status, worktree.reason = "SQUASHED", f"changes squash-merged into {target_name}"
+    elif upstream_gone:
+        worktree.status, worktree.reason = "GONE", f"upstream {upstream.removeprefix('refs/remotes/')} deleted, unmerged commits"
+    elif not worktree.branch:
+        worktree.status, worktree.reason = "ACTIVE", "detached HEAD with unmerged commits"
+    elif not upstream:
+        worktree.status, worktree.reason = "ACTIVE", "local-only branch with unmerged commits"
+    else:
+        worktree.status, worktree.reason = "ACTIVE", "upstream exists, unmerged"
+
+
+def analyze_repo(repo, remote, fetch):
+    warnings = []
+    if fetch:
+        fetched = git(repo, "fetch", "--prune", "--quiet", remote)
+        if fetched.returncode != 0:
+            warnings.append(f"fetch failed in {repo}: {fetched.stderr.strip()}")
+    try:
+        worktrees = list_worktrees(repo)
+    except RuntimeError as error:
+        return [], [str(error)]
+    target_ref = default_branch_ref(repo, remote)
+    for worktree in worktrees:
+        classify(worktree, target_ref)
+    return worktrees, warnings
+
+
+def is_removable(worktree, force):
+    return worktree.status in DEAD_STATUSES and (force or not worktree.dirty)
+
+
+def remove(worktree, delete_branch):
+    if worktree.status == "MISSING":
+        git(worktree.repo, "worktree", "prune")
+        worktree.actions.append("pruned")
+    else:
+        args = ["worktree", "remove"] + (["--force"] if worktree.dirty else []) + [worktree.path]
+        result = git(worktree.repo, *args)
+        if result.returncode != 0:
+            worktree.actions.append(f"remove failed: {result.stderr.strip()}")
+            return
+        worktree.actions.append("removed")
+    if delete_branch and worktree.branch:
+        result = git(worktree.repo, "branch", "-D", worktree.branch)
+        worktree.actions.append("branch deleted" if result.returncode == 0 else f"branch delete failed: {result.stderr.strip()}")
+
+
+def print_table(worktrees, root):
+    headers = ("STATUS", "DIRTY", "BRANCH", "PATH", "REASON")
+    rows = [
+        (
+            w.status,
+            "yes" if w.dirty else "",
+            w.branch or f"({w.head[:7]})",
+            os.path.relpath(w.path, root),
+            "; ".join([w.reason, *w.actions]),
+        )
+        for w in worktrees
+    ]
+    widths = [max(len(str(row[i])) for row in [headers, *rows]) for i in range(len(headers) - 1)]
+    for row in [headers, *rows]:
+        print("  ".join(str(cell).ljust(width) for cell, width in zip(row, widths)) + "  " + row[-1])
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Find git worktrees whose branch is merged or deleted on the remote.")
+    parser.add_argument("root", nargs="?", default=os.path.expanduser("~/work"))
+    parser.add_argument("--remote", default="origin")
+    parser.add_argument("--no-fetch", action="store_true", help="skip git fetch --prune")
+    parser.add_argument("--all", action="store_true", help="also list ACTIVE / NO_COMMITS / LOCKED worktrees")
+    parser.add_argument("--remove", action="store_true", help="remove dead worktrees (default is dry run)")
+    parser.add_argument("--delete-branches", action="store_true", help="with --remove, also delete the local branch")
+    parser.add_argument("--force", action="store_true", help="with --remove, also remove dead worktrees with uncommitted changes")
+    parser.add_argument("--jobs", type=int, default=8)
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    root = os.path.abspath(args.root)
+    repos = find_repos(root)
+    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        results = list(pool.map(lambda repo: analyze_repo(repo, args.remote, not args.no_fetch), repos))
+
+    worktrees = []
+    for repo_worktrees, warnings in results:
+        worktrees.extend(repo_worktrees)
+        for warning in warnings:
+            print(f"warning: {warning}", file=sys.stderr)
+    worktrees.sort(key=lambda w: (w.repo, w.path))
+
+    dead = [w for w in worktrees if w.status in DEAD_STATUSES]
+    if args.remove:
+        for worktree in dead:
+            if is_removable(worktree, args.force):
+                remove(worktree, args.delete_branches)
+            else:
+                worktree.actions.append("skipped: dirty (use --force)")
+
+    shown = worktrees if args.all else dead
+    if shown:
+        print_table(shown, root)
+    skipped_dirty = sum(1 for w in dead if w.dirty and not args.force)
+    print(
+        f"\n{len(repos)} repos, {len(worktrees)} linked worktrees, {len(dead)} dead"
+        + (f" ({skipped_dirty} dirty)" if skipped_dirty else "")
+        + ("" if args.remove else " — dry run, pass --remove to delete"),
+        file=sys.stderr,
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -670,6 +670,16 @@ install_node_tools() {
   done
 }
 
+install_bin() {
+  mkdir -p "$HOME/.local/bin"
+  local bin
+  for bin in "$DOTFILES/bin"/*; do
+    [ -x "$bin" ] || continue
+    ln -sf "$bin" "$HOME/.local/bin/$(basename "$bin")"
+    echo "LINK  $HOME/.local/bin/$(basename "$bin") -> $bin"
+  done
+}
+
 # Antigravity CLI (`agy`, Google's agentic dev tool) settings: telemetry off,
 # no extraneous AI nudges (tips banner/feedback surveys/notifications) — same
 # policy as the Claude telemetry opt-outs elsewhere in this repo. Merged
@@ -790,6 +800,8 @@ if [ "$IS_DARWIN" = 1 ]; then
 
   # Install pinned npm CLI tools from tools/package-lock.json
   install_node_tools
+
+  install_bin
 
   # Weekday-9am session-log launchd agent (self-skips without ~/work/notes)
   install_session_log_agent
