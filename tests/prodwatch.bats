@@ -40,6 +40,40 @@ EOF
   chmod +x "$stub_dir/ccusage" "$stub_dir/gh" "$stub_dir/python3" "$stub_dir/ioreg"
 }
 
+stub_github() {
+  local stub_dir="$1" contributions="$2" prs="$3" remaining="$4" reset_at="${5:-2099-01-01T00:00:00Z}"
+  local today
+  today="$(date +%Y-%m-%d)"
+  cat > "$stub_dir/gh" <<EOF
+#!/bin/bash
+echo call >> "$TEST_DIR/gh.calls"
+cat <<'JSON'
+{"data":{
+  "viewer":{"contributionsCollection":{"contributionCalendar":{"weeks":[{"contributionDays":[
+    {"date":"2000-01-01","contributionCount":500},
+    {"date":"$today","contributionCount":$contributions}]}]}}},
+  "prsOpened":{"issueCount":$prs},
+  "authorOpened":{"nodes":[{"url":"o/r#1"},{"url":"o/r#2"}]},
+  "assigneeOpened":{"nodes":[{"url":"o/r#2"},{"url":"o/r#3"}]},
+  "authorClosed":{"nodes":[{"url":"o/r#5"}]},
+  "assigneeClosed":{"nodes":[]},
+  "rateLimit":{"remaining":$remaining,"resetAt":"$reset_at"}
+}}
+JSON
+EOF
+  chmod +x "$stub_dir/gh"
+}
+
+run_prodwatch() {
+  run env HOME="$TEST_DIR/home" PATH="$TEST_DIR/bin:$PATH" "$@" bash "$PRODWATCH"
+}
+
+setup_quiet_home() {
+  mkdir -p "$TEST_DIR/bin" "$TEST_DIR/home/work" "$TEST_DIR/home/projects"
+  stub_quiet_sources "$TEST_DIR/bin"
+  stub_disk "$TEST_DIR/bin" "" "" ""
+}
+
 stub_battery() {
   local stub_dir="$1" design="$2" nominal="$3" cycles="$4" failure="$5"
   cat > "$stub_dir/ioreg" <<STUB
@@ -257,21 +291,7 @@ JSON
 EOF
   chmod +x "$stub_dir/ccusage"
 
-  # Stub gh so issue counts are deterministic and no network call is made.
-  # Emulates `gh search issues ... -q ...` by printing repo#number keys directly.
-  # author-opened {1,2} ∪ assignee-opened {2,3} → 3 distinct opened (dedup on #2);
-  # author-closed {5} ∪ assignee-closed {} → 1 closed.
-  cat > "$stub_dir/gh" <<'EOF'
-#!/bin/bash
-args="$*"
-if [[ "$args" == *"--created"* ]]; then
-  if [[ "$args" == *"--author"* ]]; then printf 'o/r#1\no/r#2\n'
-  else printf 'o/r#2\no/r#3\n'; fi
-elif [[ "$args" == *"--closed"* ]]; then
-  if [[ "$args" == *"--author"* ]]; then printf 'o/r#5\n'; fi
-fi
-EOF
-  chmod +x "$stub_dir/gh"
+  stub_github "$stub_dir" 77 25 4999
 
   cat > "$stub_dir/python3" <<'EOF'
 #!/bin/bash
@@ -290,7 +310,9 @@ EOF
   [ "$status" -eq 0 ]
 
   # Check menubar header (three cycling title lines): commits + issues, cost/tokens, temp/disk
-  [[ "$output" =~ "<> 0 · 🐛 ↑3/↓1 | font=Menlo size=13" ]]
+  [[ "$output" =~ "<> 77 · PR 25 | font=Menlo size=13" ]]
+  [[ "$output" =~ "🐛 ↑3/↓1 | font=Menlo size=13" ]]
+  [[ "$output" =~ "GitHub today · 77 contributions · 25 PRs | font=Menlo" ]]
   [[ "$output" =~ "45°C · 💾 13% free | font=Menlo size=13" ]]
   [[ "$output" =~ "SoC temp · avg 45°C · max 49°C | font=Menlo" ]]
   [[ "$output" =~ "Disk · SMART Verified · 124Gi free (13%) | font=Menlo" ]]
@@ -338,7 +360,8 @@ EOF
 
   run env HOME="$fake_home" PATH="$stub_dir:$PATH" bash "$PRODWATCH"
   [ "$status" -eq 0 ]
-  [[ "$output" =~ "<> 0 · 🐛 ↑0/↓0 | font=Menlo size=13" ]]
+  [[ "$output" =~ "<> 0 | font=Menlo size=13" ]]
+  [[ "$output" =~ "🐛 ↑0/↓0 | font=Menlo size=13" ]]
   [[ "$output" =~ "Issues today · ↑0 opened · ↓0 closed | font=Menlo" ]]
   [[ ! "$output" =~ "°C" ]]
 }
@@ -375,7 +398,8 @@ EOF
 
   run env HOME="$TEST_DIR/home" PATH="$stub_dir:$PATH" bash "$PRODWATCH"
   [ "$status" -eq 0 ]
-  [[ "$output" =~ "<> 0 · 🐛 ↑0/↓0 | font=Menlo size=13" ]]
+  [[ "$output" =~ "<> 0 | font=Menlo size=13" ]]
+  [[ "$output" =~ "🐛 ↑0/↓0 | font=Menlo size=13" ]]
   [[ ! "$output" =~ "Disk ·" ]]
   [[ ! "$output" =~ "💾" ]]
 }
@@ -506,5 +530,66 @@ EOF2
   [ "$status" -eq 0 ]
   [[ "$output" =~ "github.com/NUSXGrok" ]]
   [[ "$output" =~ "office-repo" ]]
-  [[ "$output" =~ "<> 1 ·" ]]
+  [[ "$output" =~ "<> 1 |" ]]
+}
+
+@test "prodwatch falls back to local commit count when GitHub has no data" {
+  setup_quiet_home
+  run_prodwatch
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "<> 0 | font=Menlo size=13" ]]
+  [[ "$output" =~ "🐛 ↑0/↓0 | font=Menlo size=13" ]]
+  [[ ! "$output" =~ "GitHub today" ]]
+}
+
+@test "prodwatch reuses a fresh GitHub cache instead of calling the API" {
+  setup_quiet_home
+  stub_github "$TEST_DIR/bin" 7 1 4999
+  run_prodwatch
+  [ "$status" -eq 0 ]
+
+  stub_github "$TEST_DIR/bin" 99 9 4999
+  run_prodwatch
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "<> 7 · PR 1 |" ]]
+  [ "$(wc -l < "$TEST_DIR/gh.calls")" -eq 1 ]
+}
+
+@test "prodwatch refetches GitHub once the cache is older than the TTL" {
+  setup_quiet_home
+  stub_github "$TEST_DIR/bin" 7 1 4999
+  run_prodwatch
+  stub_github "$TEST_DIR/bin" 99 9 4999
+  run_prodwatch PRODWATCH_GH_TTL=0
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "<> 99 · PR 9 |" ]]
+  [ "$(wc -l < "$TEST_DIR/gh.calls")" -eq 2 ]
+}
+
+@test "prodwatch keeps the last good GitHub cache when the API fails" {
+  setup_quiet_home
+  stub_github "$TEST_DIR/bin" 7 1 4999
+  run_prodwatch
+  printf '#!/bin/bash\necho "{\\"errors\\":[{\\"type\\":\\"RATE_LIMITED\\"}]}"\nexit 1\n' > "$TEST_DIR/bin/gh"
+  run_prodwatch PRODWATCH_GH_TTL=0
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "<> 7 · PR 1 |" ]]
+}
+
+@test "prodwatch stops calling GitHub while the rate budget is low" {
+  setup_quiet_home
+  stub_github "$TEST_DIR/bin" 7 1 100
+  run_prodwatch
+  run_prodwatch PRODWATCH_GH_TTL=0
+  [ "$status" -eq 0 ]
+  [ "$(wc -l < "$TEST_DIR/gh.calls")" -eq 1 ]
+}
+
+@test "prodwatch resumes calling GitHub after the rate limit resets" {
+  setup_quiet_home
+  stub_github "$TEST_DIR/bin" 7 1 100 "2000-01-01T00:00:00Z"
+  run_prodwatch
+  run_prodwatch PRODWATCH_GH_TTL=0
+  [ "$status" -eq 0 ]
+  [ "$(wc -l < "$TEST_DIR/gh.calls")" -eq 2 ]
 }

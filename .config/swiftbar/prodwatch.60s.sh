@@ -52,24 +52,61 @@ USAGE_RAW="$(mktemp)"
 ) &
 USAGE_PID=$!
 
-# Kick off GitHub issue counts (network-bound) in the background too. Counts
-# distinct issues opened/closed today where I'm the author OR assignee — four
-# search-API calls (30/min budget), deduped by repo#number so an issue that is
-# both authored and assigned isn't double-counted. Writes "opened<TAB>closed".
-GH_RAW="$(mktemp)"
-(
-  if command -v gh >/dev/null 2>&1; then
-    gh_today="$(date +%Y-%m-%d)"
-    issue_keys() {
-      gh search issues "$@" --limit 100 --json number,repository \
-        -q '.[] | "\(.repository.nameWithOwner)#\(.number)"' 2>/dev/null
+GH_CACHE="$CACHE_DIR/github-$(date +%Y%m%d).json"
+GH_TTL="${PRODWATCH_GH_TTL:-300}"
+GH_MIN_REMAINING="${PRODWATCH_GH_MIN_REMAINING:-500}"
+GITHUB_QUERY='
+query($from: DateTime!, $prsOpened: String!, $authorOpened: String!, $assigneeOpened: String!,
+      $authorClosed: String!, $assigneeClosed: String!) {
+  viewer {
+    contributionsCollection(from: $from) {
+      contributionCalendar { weeks { contributionDays { date contributionCount } } }
     }
-    opened=$( { issue_keys --author=@me --created=">=$gh_today"
-               issue_keys --assignee=@me --created=">=$gh_today"; } | sort -u | grep -c . )
-    closed=$( { issue_keys --author=@me --closed=">=$gh_today"
-               issue_keys --assignee=@me --closed=">=$gh_today"; } | sort -u | grep -c . )
-    printf '%s\t%s\n' "${opened:-0}" "${closed:-0}" >"$GH_RAW"
+  }
+  prsOpened: search(query: $prsOpened, type: ISSUE) { issueCount }
+  authorOpened: search(query: $authorOpened, type: ISSUE, first: 100) { nodes { ... on Issue { url } } }
+  assigneeOpened: search(query: $assigneeOpened, type: ISSUE, first: 100) { nodes { ... on Issue { url } } }
+  authorClosed: search(query: $authorClosed, type: ISSUE, first: 100) { nodes { ... on Issue { url } } }
+  assigneeClosed: search(query: $assigneeClosed, type: ISSUE, first: 100) { nodes { ... on Issue { url } } }
+  rateLimit { remaining resetAt }
+}'
+
+github_cache_is_fresh() {
+  local age
+  [ -s "$GH_CACHE" ] || return 1
+  age="$(cache_age_seconds "$GH_CACHE")" || return 1
+  [ "$age" -lt "$GH_TTL" ]
+}
+
+github_budget_is_low() {
+  [ -s "$GH_CACHE" ] || return 1
+  jq -e --argjson floor "$GH_MIN_REMAINING" \
+    '.data.rateLimit | .remaining < $floor and (.resetAt | fromdateiso8601) > now' \
+    "$GH_CACHE" >/dev/null 2>&1
+}
+
+refresh_github_cache() {
+  local fresh midnight
+  command -v gh >/dev/null 2>&1 || return
+  mkdir -p "$CACHE_DIR"
+  midnight="$(date +%Y-%m-%dT00:00:00%z | sed 's/\(..\)$/:\1/')"
+  fresh="$(mktemp "$CACHE_DIR/github.XXXXXX")"
+  if gh api graphql -f query="$GITHUB_QUERY" -f from="$midnight" \
+      -f prsOpened="is:pr author:@me created:>=$midnight" \
+      -f authorOpened="is:issue author:@me created:>=$midnight" \
+      -f assigneeOpened="is:issue assignee:@me created:>=$midnight" \
+      -f authorClosed="is:issue author:@me closed:>=$midnight" \
+      -f assigneeClosed="is:issue assignee:@me closed:>=$midnight" >"$fresh" 2>/dev/null \
+    && jq -e '.data.viewer.contributionsCollection' "$fresh" >/dev/null 2>&1; then
+    mv -f "$fresh" "$GH_CACHE"
+    find "$CACHE_DIR" -name 'github-*.json' ! -name "$(basename "$GH_CACHE")" -delete 2>/dev/null
+  else
+    rm -f "$fresh"
   fi
+}
+
+(
+  github_cache_is_fresh || github_budget_is_low || refresh_github_cache
 ) &
 GH_PID=$!
 
@@ -220,11 +257,19 @@ tot_cost="${tot_cost:-0.00}"; tot_htok="${tot_htok:-0}"
 c_cost="${c_cost:-0.00}"; c_htok="${c_htok:-0}"; c_models="${c_models:--}"
 a_cost="${a_cost:-0.00}"; a_htok="${a_htok:-0}"; a_models="${a_models:--}"
 
-# --- GitHub issues today ---
+# --- GitHub activity today ---
 wait "$GH_PID" 2>/dev/null
-IFS=$'\t' read -r gh_opened gh_closed < "$GH_RAW" 2>/dev/null
-rm -f "$GH_RAW"
+IFS=$'\t' read -r gh_contributions gh_prs gh_opened gh_closed < <(jq -r --arg today "$(date +%Y-%m-%d)" '
+  .data
+  | [([.viewer.contributionsCollection.contributionCalendar.weeks[].contributionDays[]
+       | select(.date == $today) | .contributionCount] | add // 0),
+     .prsOpened.issueCount,
+     ([.authorOpened, .assigneeOpened] | map(.nodes[].url) | unique | length),
+     ([.authorClosed, .assigneeClosed] | map(.nodes[].url) | unique | length)]
+  | @tsv' "$GH_CACHE" 2>/dev/null)
 gh_opened="${gh_opened:-0}"; gh_closed="${gh_closed:-0}"
+commit_title="${gh_contributions:-$total_commits}"
+[ -n "$gh_prs" ] && commit_title+=" · PR ${gh_prs}"
 
 wait "$TEMP_PID" 2>/dev/null
 IFS=$'\t' read -r soc_avg soc_max < "$TEMP_RAW" 2>/dev/null
@@ -284,7 +329,8 @@ print_section() {
 # ================= SwiftBar output =================
 # Title lines before the first "---" cycle (rotate ~5s) in the menu bar —
 # narrower than one long line, since the menu bar can't stack rows vertically.
-echo "<> ${total_commits} · 🐛 ↑${gh_opened}/↓${gh_closed} | font=Menlo size=13"
+echo "<> ${commit_title} | font=Menlo size=13"
+echo "🐛 ↑${gh_opened}/↓${gh_closed} | font=Menlo size=13"
 echo "\$${tot_cost} · ${tot_htok} | font=Menlo size=13"
 [ -n "$system_title" ] && echo "${system_title} | font=Menlo size=13"
 echo "---"
@@ -296,6 +342,7 @@ echo "Claude today · \$${c_cost} · ${c_htok} tok | font=Menlo"
 [ "$c_models" != "-" ] && echo "models: ${c_models} | font=Menlo size=12 color=gray"
 echo "Antigravity today · \$${a_cost} · ${a_htok} tok | font=Menlo"
 [ "$a_models" != "-" ] && echo "models: ${a_models} | font=Menlo size=12 color=gray"
+[ -n "$gh_contributions" ] && echo "GitHub today · ${gh_contributions} contributions · ${gh_prs} PRs | font=Menlo"
 echo "Issues today · ↑${gh_opened} opened · ↓${gh_closed} closed | font=Menlo"
 echo "author or assignee · github.com/$GITHUB_USER | font=Menlo size=12 color=gray href=https://github.com/$GITHUB_USER"
 [ -n "$soc_avg" ] && echo "SoC temp · avg ${soc_avg}°C · max ${soc_max}°C | font=Menlo"
